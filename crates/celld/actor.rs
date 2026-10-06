@@ -3070,11 +3070,19 @@ impl Actor {
                 let (arm, _) = self.timer_slots.arm(timer, at_mono_ms, ());
                 out.timers.push(arm);
             }
-            Effect::ReadSelfNodeLease { op } => {
+            Effect::ReadSelfNodeLease {
+                op,
+                authority_expires_ms,
+            } => {
                 let ownership = self.ownership.clone();
                 let node = self.state.node().to_string();
                 out.effects.push(Box::pin(async move {
-                    let result = ownership.read_self_node_lease(&node).await;
+                    let result = read_self_node_lease_bounded(
+                        &node,
+                        authority_expires_ms,
+                        ownership.read_self_node_lease(&node),
+                    )
+                    .await;
                     CompletedEffect::plain(Event::SelfNodeLeaseRead {
                         op,
                         now_ms: now_ms(),
@@ -3127,9 +3135,7 @@ impl Actor {
                     let mut stamped_log_state = None;
                     let result = match authority_expires_ms {
                         Some(expires_ms) => {
-                            let remaining = expires_ms.saturating_sub(now_ms());
-                            let bound =
-                                std::time::Duration::from_millis((remaining / 2).clamp(250, 2_500));
+                            let bound = renewal_bound(expires_ms, now_ms());
                             match crate::asyncrt::timeout(
                                 bound,
                                 ownership.cas_node_lease(guard, record, &mut stamped_log_state),
@@ -4306,6 +4312,90 @@ fn request_error_phase(error: RequestError) -> &'static str {
     }
 }
 
+/// How long a lease request issued under prior authority may run: half the
+/// authority that remains, floored to whole milliseconds and clamped to
+/// 250..=2500 ms. Past the deadline the wall clock has already ended authority,
+/// so an expired `expires_ms` still yields the floor.
+fn renewal_bound(authority_expires_ms: u64, now_ms: u64) -> std::time::Duration {
+    let remaining = authority_expires_ms.saturating_sub(now_ms);
+    std::time::Duration::from_millis((remaining / 2).clamp(250, 2_500))
+}
+
+/// Run the self-lease readback. A readback after a failed renewal is bounded
+/// like the renewal itself, so it returns while authority remains and the core
+/// can schedule the next attempt; a timeout is `Definite` because a read
+/// commits nothing. The initial acquire has no authority to protect and stays
+/// unbounded. Retry scheduling stays in the core.
+async fn read_self_node_lease_bounded<F>(
+    node: &str,
+    authority_expires_ms: Option<u64>,
+    read: F,
+) -> Result<Option<NodeLeaseRecord>, Failure>
+where
+    F: Future<Output = Result<Option<NodeLeaseRecord>, Failure>>,
+{
+    let started_mono_ms = crate::asyncrt::mono_ms();
+    let started_ms = now_ms();
+    let bound = authority_expires_ms.map(|expires_ms| renewal_bound(expires_ms, started_ms));
+    let bound_ms = bound.map_or(0, |bound| bound.as_millis() as u64);
+    let headroom_ms = |at_ms: u64| {
+        authority_expires_ms
+            .map(|expires_ms| expires_ms.saturating_sub(at_ms))
+            .unwrap_or(0)
+    };
+    tracing::info!(
+        event = "node_lease_readback_started",
+        %node,
+        bound_ms,
+        prior_authority_headroom_ms = headroom_ms(started_ms),
+        "node lease readback started"
+    );
+    let mut timed_out = false;
+    let result = match bound {
+        Some(bound) => match crate::asyncrt::timeout(bound, read).await {
+            Ok(result) => result,
+            Err(_) => {
+                timed_out = true;
+                Err(Failure::Definite)
+            }
+        },
+        None => read.await,
+    };
+    let elapsed_ms = crate::asyncrt::mono_ms().saturating_sub(started_mono_ms);
+    let prior_authority_headroom_ms = headroom_ms(now_ms());
+    match &result {
+        Ok(Some(record)) => tracing::info!(
+            event = "node_lease_readback",
+            %node,
+            outcome = "found",
+            elapsed_ms,
+            bound_ms,
+            prior_authority_headroom_ms,
+            generation = %record.generation,
+            "node lease readback completed"
+        ),
+        Ok(None) => tracing::info!(
+            event = "node_lease_readback",
+            %node,
+            outcome = "missing",
+            elapsed_ms,
+            bound_ms,
+            prior_authority_headroom_ms,
+            "node lease readback completed"
+        ),
+        Err(_) => tracing::warn!(
+            event = "node_lease_readback",
+            %node,
+            outcome = if timed_out { "timeout" } else { "error" },
+            elapsed_ms,
+            bound_ms,
+            prior_authority_headroom_ms,
+            "node lease readback did not complete"
+        ),
+    }
+    result
+}
+
 #[cfg(not(all(test, celld_internal_tests)))]
 type ActorState = State;
 
@@ -4316,3 +4406,203 @@ fn apply_core_event(state: &mut ActorState, event: Event) -> Vec<Effect> {
 
 #[cfg(all(test, celld_internal_tests))]
 include!(env!("CELLD_INTERNAL_ACTOR_OBSERVERS"));
+
+#[cfg(test)]
+mod node_lease_readback_tests {
+    use super::{read_self_node_lease_bounded, renewal_bound};
+    use celld_logic::{Failure, NodeLeaseRecord};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[test]
+    fn renewal_bound_is_half_the_remaining_authority_clamped() {
+        const NOW: u64 = 1_000_000;
+        let table: [(u64, u64); 12] = [
+            (0, 250),
+            (1, 250),
+            (499, 250),
+            (500, 250),
+            (501, 250),
+            (999, 499),
+            (1_000, 500),
+            (4_167, 2_083),
+            (5_000, 2_500),
+            (5_001, 2_500),
+            (60_000, 2_500),
+            (u64::MAX - NOW, 2_500),
+        ];
+        for (remaining, expected_ms) in table {
+            assert_eq!(
+                renewal_bound(NOW + remaining, NOW),
+                Duration::from_millis(expected_ms),
+                "remaining {remaining}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn renewal_bound_of_an_already_expired_authority_is_the_floor() {
+        assert_eq!(renewal_bound(10, 1_000), Duration::from_millis(250));
+        assert_eq!(renewal_bound(0, u64::MAX), Duration::from_millis(250));
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+
+    fn lines(captured: &Captured) -> Vec<String> {
+        String::from_utf8(captured.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn record() -> NodeLeaseRecord {
+        NodeLeaseRecord {
+            node: "n1".into(),
+            addr: "127.0.0.1:1".into(),
+            expires_ms: 1,
+            peer_protocol: 1,
+            generation: "gen-secret-free".into(),
+            log_state: None,
+            etag: "etag-must-not-log".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_readback_times_out_as_definite() {
+        let (captured, _guard) = capture();
+        // Expired authority: the 250ms floor applies.
+        let started_ms = crate::asyncrt::mono_ms();
+        let result = read_self_node_lease_bounded(
+            "n1",
+            Some(crate::ownership_store::now_ms()),
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(result, Err(Failure::Definite)));
+        let elapsed_ms = crate::asyncrt::mono_ms() - started_ms;
+        assert!((250..2_000).contains(&elapsed_ms), "{elapsed_ms}");
+
+        let lines = lines(&captured);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains(" INFO "), "{}", lines[0]);
+        assert!(lines[0].contains("event=\"node_lease_readback_started\""));
+        assert!(lines[0].contains("bound_ms=250"), "{}", lines[0]);
+        assert!(lines[0].contains("prior_authority_headroom_ms="));
+        assert!(lines[1].contains(" WARN "), "{}", lines[1]);
+        assert!(lines[1].contains("event=\"node_lease_readback\""));
+        assert!(lines[1].contains("outcome=\"timeout\""), "{}", lines[1]);
+        for field in [
+            "elapsed_ms=",
+            "bound_ms=250",
+            "prior_authority_headroom_ms=0",
+        ] {
+            assert!(lines[1].contains(field), "{field} in {}", lines[1]);
+        }
+        assert!(!lines[1].contains("generation="));
+    }
+
+    #[tokio::test]
+    async fn found_readback_logs_generation_and_nothing_secret() {
+        let (captured, _guard) = capture();
+        let expires = crate::ownership_store::now_ms() + 5_100;
+        let result =
+            read_self_node_lease_bounded("n1", Some(expires), async { Ok(Some(record())) }).await;
+        assert!(matches!(result, Ok(Some(_))));
+        let lines = lines(&captured);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("bound_ms=2500"), "{}", lines[0]);
+        assert!(lines[1].contains(" INFO "), "{}", lines[1]);
+        assert!(lines[1].contains("outcome=\"found\""), "{}", lines[1]);
+        assert!(
+            lines[1].contains("generation=gen-secret-free"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines.iter().all(|line| !line.contains("etag")));
+        assert!(lines.iter().all(|line| !line.contains("127.0.0.1")));
+    }
+
+    #[tokio::test]
+    async fn missing_and_error_readbacks_keep_their_results() {
+        let (captured, _guard) = capture();
+        let missing = read_self_node_lease_bounded("n1", None, async { Ok(None) }).await;
+        assert!(matches!(missing, Ok(None)));
+        let error =
+            read_self_node_lease_bounded("n1", None, async { Err(Failure::Definite) }).await;
+        assert!(matches!(error, Err(Failure::Definite)));
+        let lines = lines(&captured);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].contains("bound_ms=0"), "unbounded initial read");
+        assert!(lines[1].contains(" INFO ") && lines[1].contains("outcome=\"missing\""));
+        assert!(!lines[1].contains("generation="));
+        assert!(lines[3].contains(" WARN ") && lines[3].contains("outcome=\"error\""));
+    }
+
+    #[tokio::test]
+    async fn bounded_readback_store_error_logs_error_not_timeout() {
+        let (captured, _guard) = capture();
+        let expires = crate::ownership_store::now_ms() + 5_100;
+        let started_ms = crate::asyncrt::mono_ms();
+        let result =
+            read_self_node_lease_bounded("n1", Some(expires), async { Err(Failure::Definite) })
+                .await;
+        assert!(matches!(result, Err(Failure::Definite)));
+        // The error returned inside the bound; nothing waited for it.
+        assert!(crate::asyncrt::mono_ms() - started_ms < 250);
+        let lines = lines(&captured);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("bound_ms=2500") && !lines[0].contains("bound_ms=0"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains(" WARN "), "{}", lines[1]);
+        assert!(lines[1].contains("outcome=\"error\""), "{}", lines[1]);
+        assert!(!lines[1].contains("timeout"), "{}", lines[1]);
+        assert!(lines[1].contains("bound_ms=2500"), "{}", lines[1]);
+    }
+
+    #[tokio::test]
+    async fn initial_readback_is_not_bounded() {
+        // No prior authority: a read slower than the renewal floor still lands.
+        let result = read_self_node_lease_bounded("n1", None, async {
+            crate::asyncrt::sleep(Duration::from_millis(400)).await;
+            Ok(Some(record()))
+        })
+        .await;
+        assert!(matches!(result, Ok(Some(_))));
+    }
+}

@@ -1030,6 +1030,11 @@ pub enum Effect {
     },
     ReadSelfNodeLease {
         op: OpId,
+        /// The published expiry of the authority held while a renewal's
+        /// outcome is unknown. The shell bounds the read by what remains of
+        /// it, as it does the renewal. The initial acquisition has no prior
+        /// authority and reads unbounded.
+        authority_expires_ms: Option<u64>,
     },
     CasNodeLease {
         op: OpId,

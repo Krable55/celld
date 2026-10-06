@@ -2321,7 +2321,10 @@ impl State {
         };
         let op = self.op();
         self.node_authority = NodeAuthority::Reading { op, pending };
-        effects.push(Effect::ReadSelfNodeLease { op });
+        effects.push(Effect::ReadSelfNodeLease {
+            op,
+            authority_expires_ms: None,
+        });
     }
 
     fn fail_initial_node_lease(&mut self, spec: NodeLeaseSpec, effects: &mut Vec<Effect>) {
@@ -2724,8 +2727,13 @@ impl State {
                 let read = self.op();
                 let mut pending = pending;
                 pending.desired.log_state = stamped_log_state;
+                let authority_expires_ms =
+                    pending.prior.as_ref().map(|prior| prior.record.expires_ms);
                 self.node_authority = NodeAuthority::Reading { op: read, pending };
-                effects.push(Effect::ReadSelfNodeLease { op: read });
+                effects.push(Effect::ReadSelfNodeLease {
+                    op: read,
+                    authority_expires_ms,
+                });
             }
             Err(Failure::Ambiguous) => {
                 let read = self.op();
@@ -2735,8 +2743,13 @@ impl State {
                 // serialized into this attempt, never the core's
                 // pre-attempt belief.
                 pending.desired.log_state = stamped_log_state;
+                let authority_expires_ms =
+                    pending.prior.as_ref().map(|prior| prior.record.expires_ms);
                 self.node_authority = NodeAuthority::Reading { op: read, pending };
-                effects.push(Effect::ReadSelfNodeLease { op: read });
+                effects.push(Effect::ReadSelfNodeLease {
+                    op: read,
+                    authority_expires_ms,
+                });
             }
             Err(Failure::Definite) => {
                 if let Some(prior) = pending.prior {
