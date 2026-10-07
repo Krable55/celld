@@ -37,6 +37,23 @@ pub mod wake;
 mod types;
 pub use types::*;
 
+/// Authority a readback must leave for the core's retry: the retry wait (a
+/// quarter of what remains, 187 ms), one CAS bounded to half of what is then
+/// left (281 ms), and one more readback at its 250 ms floor.
+/// 187 + 281 + 250 = 718 <= 750.
+pub const NODE_LEASE_RETRY_RESERVE_MS: u64 = 750;
+/// The shortest a lease request issued under prior authority may be bounded.
+pub const NODE_LEASE_REQUEST_FLOOR_MS: u64 = 250;
+
+/// Bound for a readback issued under prior authority, from the authority that
+/// remains when it starts. Never longer than `remaining_ms`, so the shell never
+/// waits past the published expiry.
+pub fn node_lease_readback_bound_ms(remaining_ms: u64) -> u64 {
+    remaining_ms
+        .saturating_sub(NODE_LEASE_RETRY_RESERVE_MS)
+        .max(NODE_LEASE_REQUEST_FLOOR_MS.min(remaining_ms))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Activation {
     Claim(Claim),
@@ -2540,6 +2557,17 @@ impl State {
                 pending,
             };
             return;
+        }
+        // No readback result is acted on once prior authority has ended, by
+        // the same test `timer_fired` applies, so the timer and the readback
+        // cannot disagree about whether the lease is still ours.
+        if let Some(prior) = &pending.prior {
+            if now_ms >= prior.record.expires_ms
+                || now_mono_ms.saturating_sub(prior.last_ok_mono_ms) >= prior.spec.ttl_ms
+            {
+                self.fence_node(HaltReason::NodeLeaseExpired, effects);
+                return;
+            }
         }
         match result {
             Err(_) => {

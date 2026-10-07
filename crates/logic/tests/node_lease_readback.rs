@@ -5,8 +5,9 @@
 //! the core either scheduling a retry or fencing.
 
 use celld_logic::{
-    on_event, CasGuard, Config, Effect, Event, Failure, HaltReason, LeaseCasOutcome,
-    NodeLeaseRecord, NodeLeaseSpec, OpId, OwnershipOnEvict, State, Timer,
+    node_lease_readback_bound_ms, on_event, CasGuard, Config, Effect, Event, Failure, HaltReason,
+    LeaseCasOutcome, NodeLeaseRecord, NodeLeaseSpec, OpId, OwnershipOnEvict, State, Timer,
+    NODE_LEASE_REQUEST_FLOOR_MS, NODE_LEASE_RETRY_RESERVE_MS,
 };
 
 const TTL_MS: u64 = 10_000;
@@ -402,4 +403,236 @@ fn missing_readback_still_fences() {
         )),
         "{effects:?}"
     );
+}
+
+/// Deliver `result` as the readback of an ambiguous renewal at the given wall
+/// offset from `START_MS` and monotonic time. The prior authority ends at wall
+/// `TTL_MS` and monotonic `TTL_MS`.
+fn readback_result_at(
+    wall_offset_ms: u64,
+    mono_ms: u64,
+    result: impl FnOnce(&Held, NodeLeaseRecord) -> Result<Option<NodeLeaseRecord>, Failure>,
+) -> (Held, Vec<Effect>) {
+    let mut held = held();
+    let effects = renewal_failed(&mut held, Err(Failure::Ambiguous));
+    let (op, _) = read_op(&effects);
+    let desired = held.desired.clone().expect("renewal recorded its record");
+    let result = result(&held, desired);
+    let effects = on_event(
+        &mut held.state,
+        Event::SelfNodeLeaseRead {
+            op,
+            now_ms: START_MS + wall_offset_ms,
+            now_mono_ms: mono_ms,
+            result,
+        },
+    );
+    (held, effects)
+}
+
+fn zombie(held: &Held, mut desired: NodeLeaseRecord) -> Result<Option<NodeLeaseRecord>, Failure> {
+    desired.expires_ms = held.prior_expires_ms + 1_000;
+    desired.etag = "e2".to_string();
+    Ok(Some(desired))
+}
+
+fn matches_prior(
+    held: &Held,
+    mut desired: NodeLeaseRecord,
+) -> Result<Option<NodeLeaseRecord>, Failure> {
+    desired.expires_ms = held.prior_expires_ms;
+    desired.etag = "e2".to_string();
+    Ok(Some(desired))
+}
+
+fn matches_desired(
+    _: &Held,
+    mut desired: NodeLeaseRecord,
+) -> Result<Option<NodeLeaseRecord>, Failure> {
+    desired.etag = "e2".to_string();
+    Ok(Some(desired))
+}
+
+fn timed_out(_: &Held, _: NodeLeaseRecord) -> Result<Option<NodeLeaseRecord>, Failure> {
+    Err(Failure::Definite)
+}
+
+fn assert_fenced_expired(held: &Held, effects: &[Effect]) {
+    assert_eq!(
+        halts(effects),
+        vec![HaltReason::NodeLeaseExpired],
+        "{effects:?}"
+    );
+    assert!(renew_timers(effects).is_empty(), "{effects:?}");
+    assert!(held.state.is_fenced());
+}
+
+type Shape = fn(&Held, NodeLeaseRecord) -> Result<Option<NodeLeaseRecord>, Failure>;
+
+/// The readback arrives at or after prior authority's end by either clock.
+/// Wall-only (suspended monotonic clock) and monotonic-only (stepped-back
+/// wall clock) are each enough, matching `timer_fired`'s `lease_expired`.
+fn expiry_points() -> [(&'static str, u64, u64); 4] {
+    [
+        ("both clocks at expiry", TTL_MS, TTL_MS),
+        ("monotonic at expiry", 9_000, TTL_MS),
+        ("wall at expiry", TTL_MS, 9_000),
+        ("both clocks past expiry", TTL_MS + 40, TTL_MS + 40),
+    ]
+}
+
+#[test]
+fn zombie_readback_at_or_after_prior_expiry_fences() {
+    for (name, wall, mono) in expiry_points() {
+        let (held, effects) = readback_result_at(wall, mono, zombie as Shape);
+        eprintln!("{name}");
+        assert_fenced_expired(&held, &effects);
+    }
+}
+
+#[test]
+fn prior_matching_readback_at_or_after_expiry_fences() {
+    for (name, wall, mono) in expiry_points() {
+        let (held, effects) = readback_result_at(wall, mono, matches_prior as Shape);
+        eprintln!("{name}");
+        assert_fenced_expired(&held, &effects);
+    }
+}
+
+#[test]
+fn timeout_readback_at_or_after_expiry_fences() {
+    for (name, wall, mono) in expiry_points() {
+        let (held, effects) = readback_result_at(wall, mono, timed_out as Shape);
+        eprintln!("{name}");
+        assert_fenced_expired(&held, &effects);
+    }
+}
+
+#[test]
+fn desired_readback_at_or_after_expiry_fences() {
+    for (name, wall, mono) in expiry_points() {
+        let (held, effects) = readback_result_at(wall, mono, matches_desired as Shape);
+        eprintln!("{name}");
+        assert_fenced_expired(&held, &effects);
+    }
+}
+
+#[test]
+fn readback_one_millisecond_before_expiry_is_still_acted_on() {
+    let (held, effects) = readback_result_at(TTL_MS - 1, TTL_MS - 1, zombie as Shape);
+    assert_one_renew_no_halt(&held, &effects);
+    let (held, effects) = readback_result_at(TTL_MS - 1, TTL_MS - 1, matches_prior as Shape);
+    assert_one_renew_no_halt(&held, &effects);
+    let (held, effects) = readback_result_at(TTL_MS - 1, TTL_MS - 1, timed_out as Shape);
+    assert_one_renew_no_halt(&held, &effects);
+}
+
+#[test]
+fn pulse_readback_found_within_authority_is_adopted() {
+    // Renewal at ttl/3 went ambiguous at +2.5 s; the readback answers 3 045 ms
+    // after it starts, past the old half-of-remaining bound but inside
+    // authority.
+    let at = TTL_MS / 3 + 2_500 + 3_045;
+    let (held, effects) = readback_result_at(at, at, matches_desired as Shape);
+    // The anchor is the attempt's start, so the next renewal is already due
+    // and the fence is re-armed a full TTL past that anchor, after the read.
+    assert_one_renew_no_halt(&held, &effects);
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ScheduleTimer {
+                timer: Timer::NodeLeaseFence { .. },
+                at_mono_ms,
+            } if *at_mono_ms > at
+        )),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn readback_bound_leaves_the_retry_reserve() {
+    assert_eq!(NODE_LEASE_RETRY_RESERVE_MS, 750);
+    assert_eq!(NODE_LEASE_REQUEST_FLOOR_MS, 250);
+    let table: [(u64, u64); 8] = [
+        (0, 0),
+        (100, 100),
+        (250, 250),
+        (999, 250),
+        (1_000, 250),
+        (1_001, 251),
+        (4_162, 3_412),
+        (9_999, 9_249),
+    ];
+    for (remaining, expected) in table {
+        assert_eq!(
+            node_lease_readback_bound_ms(remaining),
+            expected,
+            "remaining {remaining}ms"
+        );
+    }
+}
+
+#[test]
+fn readback_bound_never_exceeds_remaining() {
+    for remaining in (0..=12_000u64).step_by(7).chain([u64::MAX]) {
+        let bound = node_lease_readback_bound_ms(remaining);
+        assert!(bound <= remaining, "{bound} > {remaining}");
+        assert!(
+            bound >= 250.min(remaining),
+            "{bound} < floor at {remaining}"
+        );
+    }
+}
+
+#[test]
+fn readback_bound_reserve_covers_the_retry_chain() {
+    // The chain the reserve must cover: the core's retry wait (a quarter of
+    // the reserve), the shell's CAS bound (half of what is left, clamped to
+    // 250..=2500 ms), then the readback bound over the remainder.
+    let reserve = NODE_LEASE_RETRY_RESERVE_MS;
+    let wait = reserve / 4;
+    let cas = ((reserve - wait) / 2).clamp(250, 2500);
+    let readback = node_lease_readback_bound_ms(reserve - wait - cas);
+    assert_eq!((wait, cas, readback), (187, 281, 250));
+    assert!(wait + cas + readback <= reserve);
+}
+
+#[test]
+fn readback_timeout_at_reserve_retries_before_expiry() {
+    // A readback that used `remaining - reserve` leaves 750 ms: the core
+    // retries after a quarter of that, and the retry carries the unchanged
+    // prior authority.
+    let mut held = held();
+    let effects = renewal_failed(&mut held, Err(Failure::Ambiguous));
+    let (op, _) = read_op(&effects);
+    let at = TTL_MS - NODE_LEASE_RETRY_RESERVE_MS;
+    let effects = on_event(
+        &mut held.state,
+        Event::SelfNodeLeaseRead {
+            op,
+            now_ms: START_MS + at,
+            now_mono_ms: at,
+            result: Err(Failure::Definite),
+        },
+    );
+    assert!(!halted(&effects), "{effects:?}");
+    let retry_at = at + NODE_LEASE_RETRY_RESERVE_MS / 4;
+    assert_eq!(
+        renew_timers(&effects),
+        vec![(held.renew_generation, retry_at)]
+    );
+    let effects = on_event(
+        &mut held.state,
+        Event::TimerFired {
+            timer: Timer::NodeLeaseRenew {
+                generation: held.renew_generation,
+            },
+            now_ms: START_MS + retry_at,
+            now_mono_ms: retry_at,
+        },
+    );
+    let (_, guard, _, authority) = cas_op(&effects);
+    assert_eq!(guard, CasGuard::Match("e1".to_string()));
+    assert_eq!(authority, Some(held.prior_expires_ms));
+    assert!(!halted(&effects), "{effects:?}");
 }

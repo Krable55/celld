@@ -1952,6 +1952,9 @@ pub struct Actor {
     logged_shed_reason: Option<&'static str>,
     fence: mpsc::UnboundedSender<i32>,
     timer_slots: TimerSlots<()>,
+    /// The renewal timer generation last scheduled, to tell a re-arm from a new
+    /// lease generation in the log.
+    renew_log: RenewScheduleLog,
     started: bool,
     preserving: bool,
 }
@@ -2459,6 +2462,7 @@ impl Actor {
             validate_invariants: cfg!(debug_assertions),
             fence,
             timer_slots: TimerSlots::default(),
+            renew_log: RenewScheduleLog::default(),
             started: false,
             preserving: false,
         })
@@ -3067,6 +3071,13 @@ impl Actor {
     fn execute(&mut self, effect: Effect, immediate: &mut VecDeque<Event>, out: &mut StepOutput) {
         match effect {
             Effect::ScheduleTimer { timer, at_mono_ms } => {
+                if let Timer::NodeLeaseRenew { generation } = &timer {
+                    self.renew_log.log(
+                        self.state.node(),
+                        *generation,
+                        at_mono_ms.saturating_sub(crate::asyncrt::mono_ms()),
+                    );
+                }
                 let (arm, _) = self.timer_slots.arm(timer, at_mono_ms, ());
                 out.timers.push(arm);
             }
@@ -4312,18 +4323,73 @@ fn request_error_phase(error: RequestError) -> &'static str {
     }
 }
 
-/// How long a lease request issued under prior authority may run: half the
+/// Whether a scheduled lease renewal is the core's retry or the steady cadence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenewKind {
+    Retry,
+    Cadence,
+}
+
+/// Classifies `NodeLeaseRenew` schedules by timer generation, never by delay.
+///
+/// A held lease arms its next renewal under a new generation
+/// (`hold_node_lease`), so that is the cadence however soon it is due. A
+/// failed renewal or readback re-arms the generation it already holds
+/// (`resume_node_lease_after_failure`), so the same generation twice in a row
+/// is a retry. The initial acquire's retry (`fail_initial_node_lease`) also
+/// takes a new generation and the shell cannot see the core's `Retrying`
+/// state, so it logs as cadence at debug; it is never reported as a retry
+/// and a success is never mislabelled. Scheduling stays in the core.
+#[derive(Default)]
+struct RenewScheduleLog {
+    last_generation: Option<u64>,
+}
+
+impl RenewScheduleLog {
+    fn classify(&mut self, generation: u64) -> RenewKind {
+        let same = self.last_generation.replace(generation) == Some(generation);
+        if same {
+            RenewKind::Retry
+        } else {
+            RenewKind::Cadence
+        }
+    }
+
+    /// A retry is info; the cadence is debug so an idle node stays quiet.
+    fn log(&mut self, node: &str, generation: u64, delay_ms: u64) {
+        match self.classify(generation) {
+            RenewKind::Retry => tracing::info!(
+                event = "node_lease_renew_scheduled",
+                %node,
+                kind = "retry",
+                delay_ms,
+                "node lease renew scheduled"
+            ),
+            RenewKind::Cadence => tracing::debug!(
+                event = "node_lease_renew_scheduled",
+                %node,
+                kind = "cadence",
+                delay_ms,
+                "node lease renew scheduled"
+            ),
+        }
+    }
+}
+
+/// How long a lease CAS issued under prior authority may run: half the
 /// authority that remains, floored to whole milliseconds and clamped to
-/// 250..=2500 ms. Past the deadline the wall clock has already ended authority,
-/// so an expired `expires_ms` still yields the floor.
+/// 250..=2500 ms. The CAS needs half because a readback must still follow it.
+/// Past the deadline the wall clock has already ended authority, so an expired
+/// `expires_ms` still yields the floor.
 fn renewal_bound(authority_expires_ms: u64, now_ms: u64) -> std::time::Duration {
     let remaining = authority_expires_ms.saturating_sub(now_ms);
     std::time::Duration::from_millis((remaining / 2).clamp(250, 2_500))
 }
 
-/// Run the self-lease readback. A readback after a failed renewal is bounded
-/// like the renewal itself, so it returns while authority remains and the core
-/// can schedule the next attempt; a timeout is `Definite` because a read
+/// Run the self-lease readback. A readback after a failed renewal is bounded by
+/// the authority that remains less the retry reserve
+/// (`celld_logic::node_lease_readback_bound_ms`), so it returns while authority
+/// remains and the core can schedule the next attempt; a timeout is `Definite` because a read
 /// commits nothing. The initial acquire has no authority to protect and stays
 /// unbounded. Retry scheduling stays in the core.
 async fn read_self_node_lease_bounded<F>(
@@ -4336,7 +4402,11 @@ where
 {
     let started_mono_ms = crate::asyncrt::mono_ms();
     let started_ms = now_ms();
-    let bound = authority_expires_ms.map(|expires_ms| renewal_bound(expires_ms, started_ms));
+    let bound = authority_expires_ms.map(|expires_ms| {
+        std::time::Duration::from_millis(celld_logic::node_lease_readback_bound_ms(
+            expires_ms.saturating_sub(started_ms),
+        ))
+    });
     let bound_ms = bound.map_or(0, |bound| bound.as_millis() as u64);
     let headroom_ms = |at_ms: u64| {
         authority_expires_ms
@@ -4347,6 +4417,7 @@ where
         event = "node_lease_readback_started",
         %node,
         bound_ms,
+        reserve_ms = celld_logic::NODE_LEASE_RETRY_RESERVE_MS,
         prior_authority_headroom_ms = headroom_ms(started_ms),
         "node lease readback started"
     );
@@ -4409,7 +4480,7 @@ include!(env!("CELLD_INTERNAL_ACTOR_OBSERVERS"));
 
 #[cfg(test)]
 mod node_lease_readback_tests {
-    use super::{read_self_node_lease_bounded, renewal_bound};
+    use super::{read_self_node_lease_bounded, renewal_bound, RenewKind, RenewScheduleLog};
     use celld_logic::{Failure, NodeLeaseRecord};
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -4488,6 +4559,23 @@ mod node_lease_readback_tests {
             .collect()
     }
 
+    /// The numeric value of `name=<digits>` in a log line.
+    fn field(line: &str, name: &str) -> u64 {
+        let needle = format!("{name}=");
+        let start = line
+            .match_indices(&needle)
+            .find(|(at, _)| *at == 0 || line.as_bytes()[at - 1] == b' ')
+            .unwrap_or_else(|| panic!("{name} in {line}"))
+            .0
+            + needle.len();
+        line[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} is numeric in {line}"))
+    }
+
     fn record() -> NodeLeaseRecord {
         NodeLeaseRecord {
             node: "n1".into(),
@@ -4503,11 +4591,11 @@ mod node_lease_readback_tests {
     #[tokio::test]
     async fn bounded_readback_times_out_as_definite() {
         let (captured, _guard) = capture();
-        // Expired authority: the 250ms floor applies.
+        // Near expiry: the 250ms floor applies and fits inside what remains.
         let started_ms = crate::asyncrt::mono_ms();
         let result = read_self_node_lease_bounded(
             "n1",
-            Some(crate::ownership_store::now_ms()),
+            Some(crate::ownership_store::now_ms() + 300),
             std::future::pending(),
         )
         .await;
@@ -4524,11 +4612,7 @@ mod node_lease_readback_tests {
         assert!(lines[1].contains(" WARN "), "{}", lines[1]);
         assert!(lines[1].contains("event=\"node_lease_readback\""));
         assert!(lines[1].contains("outcome=\"timeout\""), "{}", lines[1]);
-        for field in [
-            "elapsed_ms=",
-            "bound_ms=250",
-            "prior_authority_headroom_ms=0",
-        ] {
+        for field in ["elapsed_ms=", "bound_ms=250"] {
             assert!(lines[1].contains(field), "{field} in {}", lines[1]);
         }
         assert!(!lines[1].contains("generation="));
@@ -4543,7 +4627,13 @@ mod node_lease_readback_tests {
         assert!(matches!(result, Ok(Some(_))));
         let lines = lines(&captured);
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].contains("bound_ms=2500"), "{}", lines[0]);
+        // 5_100 ms remain, less the reserve; the clock may tick once.
+        assert!(
+            (4_300..=4_350).contains(&field(&lines[0], "bound_ms")),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(field(&lines[0], "reserve_ms"), 750, "{}", lines[0]);
         assert!(lines[1].contains(" INFO "), "{}", lines[1]);
         assert!(lines[1].contains("outcome=\"found\""), "{}", lines[1]);
         assert!(
@@ -4585,14 +4675,18 @@ mod node_lease_readback_tests {
         let lines = lines(&captured);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
-            lines[0].contains("bound_ms=2500") && !lines[0].contains("bound_ms=0"),
+            (4_300..=4_350).contains(&field(&lines[0], "bound_ms")),
             "{}",
             lines[0]
         );
         assert!(lines[1].contains(" WARN "), "{}", lines[1]);
         assert!(lines[1].contains("outcome=\"error\""), "{}", lines[1]);
         assert!(!lines[1].contains("timeout"), "{}", lines[1]);
-        assert!(lines[1].contains("bound_ms=2500"), "{}", lines[1]);
+        assert!(
+            (4_300..=4_350).contains(&field(&lines[1], "bound_ms")),
+            "{}",
+            lines[1]
+        );
     }
 
     #[tokio::test]
@@ -4604,5 +4698,273 @@ mod node_lease_readback_tests {
         })
         .await;
         assert!(matches!(result, Ok(Some(_))));
+    }
+
+    #[tokio::test]
+    async fn readback_slower_than_half_but_inside_reserve_is_found() {
+        let (captured, _guard) = capture();
+        // The pulse: 4_162 ms of authority left, the read answers after 2_300
+        // ms. Half of what remains (2_081) would have cut it off.
+        let expires = crate::ownership_store::now_ms() + 4_162;
+        let result = read_self_node_lease_bounded("n1", Some(expires), async {
+            crate::asyncrt::sleep(Duration::from_millis(2_300)).await;
+            Ok(Some(record()))
+        })
+        .await;
+        assert!(matches!(result, Ok(Some(_))), "{result:?}");
+        let lines = lines(&captured);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            (3_362..=3_412).contains(&field(&lines[0], "bound_ms")),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(field(&lines[0], "reserve_ms"), 750);
+        assert!(lines[1].contains("outcome=\"found\""), "{}", lines[1]);
+        assert!(field(&lines[1], "elapsed_ms") >= 2_300, "{}", lines[1]);
+        assert!(
+            field(&lines[1], "prior_authority_headroom_ms") > 0,
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn readback_is_bounded_by_remaining_minus_reserve() {
+        let (captured, _guard) = capture();
+        let expires = crate::ownership_store::now_ms() + 1_200;
+        let started_ms = crate::asyncrt::mono_ms();
+        let result =
+            read_self_node_lease_bounded("n1", Some(expires), std::future::pending()).await;
+        assert!(matches!(result, Err(Failure::Definite)));
+        let elapsed_ms = crate::asyncrt::mono_ms() - started_ms;
+        assert!((400..1_000).contains(&elapsed_ms), "{elapsed_ms}");
+        let lines = lines(&captured);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            (400..=450).contains(&field(&lines[0], "bound_ms")),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains("outcome=\"timeout\""), "{}", lines[1]);
+        // The timeout leaves the reserve for the core's retry: the headroom plus
+        // the time spent reading is the 1_200 ms of authority the read started
+        // with, give or take a clock tick, however late the timer woke.
+        let headroom = field(&lines[1], "prior_authority_headroom_ms");
+        assert!(headroom >= 500, "{}", lines[1]);
+        let spent = field(&lines[1], "elapsed_ms");
+        assert!(
+            (1_150..=1_250).contains(&(spent + headroom)),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn readback_bound_is_finite_and_within_remaining_authority() {
+        let (captured, _guard) = capture();
+        // A TTL much larger than the default still yields a finite bound that
+        // never exceeds the authority left.
+        let expires = crate::ownership_store::now_ms() + 60_000;
+        let _ =
+            read_self_node_lease_bounded("n1", Some(expires), async { Ok(Some(record())) }).await;
+        // And an already-expired authority gets no wait at all.
+        let _ = read_self_node_lease_bounded("n1", Some(1), std::future::pending()).await;
+        let lines = lines(&captured);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        let bound = field(&lines[0], "bound_ms");
+        assert!((59_200..=59_250).contains(&bound), "{}", lines[0]);
+        assert!(bound <= field(&lines[0], "prior_authority_headroom_ms"));
+        assert_eq!(field(&lines[2], "bound_ms"), 0, "{}", lines[2]);
+        assert_eq!(field(&lines[2], "prior_authority_headroom_ms"), 0);
+    }
+
+    fn log_config() -> celld_logic::Config {
+        celld_logic::Config {
+            max_resident: 8,
+            max_activations: 8,
+            max_evictions: 4,
+            max_releases: 4,
+            max_outbound_websockets: 8,
+            ownership_on_evict: celld_logic::OwnershipOnEvict::Sticky,
+            require_node_lease: true,
+            peer_protocol: 1,
+            operation_deadline_ms: None,
+            owner_log_recovery_backoff_ms: 100,
+            owner_log_recovery_attempts: 3,
+            alarm_resident_ms: 1_000,
+            idle_evict_ms: None,
+            pressure: Default::default(),
+        }
+    }
+
+    fn renew_schedules(effects: &[celld_logic::Effect]) -> Vec<u64> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                celld_logic::Effect::ScheduleTimer {
+                    timer: celld_logic::Timer::NodeLeaseRenew { generation },
+                    ..
+                } => Some(*generation),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Classify every renewal the core schedules for `effects`, in order.
+    fn classify(log: &mut RenewScheduleLog, effects: &[celld_logic::Effect]) -> Vec<RenewKind> {
+        renew_schedules(effects)
+            .into_iter()
+            .map(|generation| log.classify(generation))
+            .collect()
+    }
+
+    /// The core's real effects: a hold is cadence even when due at once, a
+    /// failure recovery re-arming the same generation is a retry, and the
+    /// next successful hold is cadence again.
+    #[test]
+    fn renew_kind_follows_timer_generation_across_a_real_effect_sequence() {
+        use celld_logic::{Effect, Event, Failure, LeaseCasOutcome, NodeLeaseSpec};
+        const TTL_MS: u64 = 10_000;
+        let mut state = celld_logic::State::new("n1", log_config());
+        let mut log = RenewScheduleLog::default();
+        let spec = NodeLeaseSpec {
+            addr: "127.0.0.1:1".to_string(),
+            peer_protocol: 1,
+            generation: "gen-1".to_string(),
+            resume_generation: None,
+            ttl_ms: TTL_MS,
+        };
+        let read_op = |effects: &[Effect]| {
+            effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::ReadSelfNodeLease { op, .. } => Some(*op),
+                    _ => None,
+                })
+                .expect("a readback")
+        };
+        let cas_op = |effects: &[Effect]| {
+            effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::CasNodeLease { op, .. } => Some(*op),
+                    _ => None,
+                })
+                .expect("a lease write")
+        };
+
+        // Initial acquire succeeds: a new generation, cadence.
+        let effects = celld_logic::on_event(
+            &mut state,
+            Event::StartNodeLease {
+                now_ms: 1_000_000,
+                now_mono_ms: 0,
+                spec,
+            },
+        );
+        let op = read_op(&effects);
+        let effects = celld_logic::on_event(
+            &mut state,
+            Event::SelfNodeLeaseRead {
+                op,
+                now_ms: 1_000_000,
+                now_mono_ms: 0,
+                result: Ok(None),
+            },
+        );
+        let op = cas_op(&effects);
+        let effects = celld_logic::on_event(
+            &mut state,
+            Event::NodeLeaseCasCompleted {
+                op,
+                now_mono_ms: 0,
+                result: Ok(LeaseCasOutcome::Applied { etag: "e1".into() }),
+                stamped_log_state: None,
+            },
+        );
+        assert_eq!(classify(&mut log, &effects), [RenewKind::Cadence]);
+        let first = renew_schedules(&effects)[0];
+
+        // The cadence timer fires and the renewal fails definitely: the core
+        // re-arms the generation it holds, which is the retry.
+        let fire = |state: &mut celld_logic::State, generation, at| {
+            celld_logic::on_event(
+                state,
+                Event::TimerFired {
+                    timer: celld_logic::Timer::NodeLeaseRenew { generation },
+                    now_ms: 1_000_000 + at,
+                    now_mono_ms: at,
+                },
+            )
+        };
+        let effects = fire(&mut state, first, 3_333);
+        let op = cas_op(&effects);
+        let effects = celld_logic::on_event(
+            &mut state,
+            Event::NodeLeaseCasCompleted {
+                op,
+                now_mono_ms: 3_400,
+                result: Err(Failure::Definite),
+                stamped_log_state: None,
+            },
+        );
+        assert_eq!(renew_schedules(&effects)[0], first);
+        assert_eq!(classify(&mut log, &effects), [RenewKind::Retry]);
+
+        // The retry succeeds: a new generation, cadence, and a delay of 0 or
+        // anything else does not matter.
+        let effects = fire(&mut state, first, 3_500);
+        let op = cas_op(&effects);
+        let effects = celld_logic::on_event(
+            &mut state,
+            Event::NodeLeaseCasCompleted {
+                op,
+                now_mono_ms: 3_520,
+                result: Ok(LeaseCasOutcome::Applied { etag: "e2".into() }),
+                stamped_log_state: None,
+            },
+        );
+        let schedules = renew_schedules(&effects);
+        assert_ne!(schedules[0], first);
+        assert_eq!(classify(&mut log, &effects), [RenewKind::Cadence]);
+    }
+
+    /// Log output for each kind: retry at info, cadence at debug only.
+    #[test]
+    fn renew_scheduled_logs_retry_at_info_and_cadence_at_debug() {
+        let (captured, _guard) = capture();
+        let mut log = RenewScheduleLog::default();
+        // New generation, due at once: cadence, so INFO stays quiet.
+        log.log("n1", 7, 0);
+        assert!(lines(&captured).is_empty(), "{:?}", lines(&captured));
+        // The same generation again, however long the wait: retry at INFO.
+        log.log("n1", 7, 3_333);
+        let info_lines = lines(&captured);
+        assert_eq!(info_lines.len(), 1, "{info_lines:?}");
+        assert!(info_lines[0].contains(" INFO "), "{}", info_lines[0]);
+        assert!(
+            info_lines[0].contains("kind=\"retry\""),
+            "{}",
+            info_lines[0]
+        );
+        assert_eq!(field(&info_lines[0], "delay_ms"), 3_333);
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        log.log("n1", 8, 0);
+        let debug_lines = lines(&captured);
+        assert_eq!(debug_lines.len(), 1, "{debug_lines:?}");
+        assert!(debug_lines[0].contains(" DEBUG "), "{}", debug_lines[0]);
+        assert!(
+            debug_lines[0].contains("kind=\"cadence\""),
+            "{}",
+            debug_lines[0]
+        );
     }
 }
